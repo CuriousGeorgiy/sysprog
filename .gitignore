@@ -1,2 +1,5 @@
-
 lectures/~$*.pptx
+
+.idea
+
+cmake-build-debug
