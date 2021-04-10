@@ -1,9 +1,9 @@
-#ifndef PIPE_H
-#define PIPE_H
+#ifndef PIPELINE_H
+#define PIPELINE_H
 
 #include <stddef.h>
 
-struct pipe {
+struct pipeline {
     struct command {
         char **argv;
     } *cmds;
@@ -14,7 +14,7 @@ struct pipe {
         char op[3];
     } redir;
 
-    char list_op[3];
+    char list_op;
 };
 
-#endif /* PIPE_H */
+#endif /* PIPELINE_H */
