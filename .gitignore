@@ -1,5 +1,4 @@
-lectures/~$*.pptx
-
 .idea
 
+CMakeLists.txt
 cmake-build-debug
