@@ -6,134 +6,280 @@
 #include <wait.h>
 #include <fcntl.h>
 
-#include "analyzer.h"
-#include "errors.h"
+#include "analyze.h"
+#include "shell_errors.h"
 #include "heap.h"
-#include "tokenizer.h"
+#include "tokenize.h"
 
-static void run_cmd(const struct command *cmd, size_t n_execs);
-void exec(const struct command *cmd);
+struct shell {
+    size_t n_bg_procs;
+} static sh;
 
-void shell_handle_input(char *const str)
+static enum shell_status exec_list(const struct list *lst);
+enum shell_status exec_pipe(const struct pipeline *pipeline);
+enum shell_status exec_single_cmd(const struct pipeline *cmd, int fd);
+
+enum shell_status shell_handle_input(char *const input)
 {
-    assert(str != NULL);
+    assert(input != NULL);
 
-    size_t n_tokens = 0;
-    size_t n_execs = 0;
-    struct token *tokens = tokenize(str, &n_tokens, &n_execs);
-    if (tokens == NULL) return;
+    size_t n_toks = 0;
+    size_t n_pipelines = 0;
+    struct token *toks = NULL;
+    enum shell_status stat = tokenize(input, &toks, &n_toks, &n_pipelines);
+    if (stat != SHELL_SUCCESS) return stat;
+    if (n_pipelines == 0) return SHELL_SUCCESS;
 
-    struct command cmd;
-    if (!analyze(&cmd, tokens, n_tokens, n_execs)) goto cleanup;
+    struct list lst = {.pipelines = NULL, .bg = false};
+    lst.pipelines = calloc(n_pipelines, sizeof(*lst.pipelines));
+    if (lst.pipelines == NULL) HANDLE_SYS_ERROR({
+                                                    stat = SHELL_SYS_ERROR;
+                                                    goto cleanup_toks;
+                                                }, "calloc: %s\n");
 
-    run_cmd(&cmd, n_execs);
-
-cleanup:
-    free_null((void **) &tokens);
-}
-
-void run_cmd(const struct command *const cmd, const size_t n_execs)
-{
-    assert(cmd != NULL);
-
-    if (n_execs == 1) {
-        exec(cmd);
-
-        return;
+    size_t pipeline_idx = 0;
+    for (size_t i = 0; i < n_toks; ++i) {
+        if (toks[i].type == CMD_NAME) ++lst.pipelines[pipeline_idx].n_cmds;
+        if (toks[i].type == LIST_OP) ++pipeline_idx;
+    }
+    for (size_t i = 0; i < n_pipelines; ++i) {
+        lst.pipelines[i].cmds = calloc(lst.pipelines[i].n_cmds, sizeof(*lst.pipelines->cmds));
+        if (lst.pipelines[i].cmds == NULL) HANDLE_SYS_ERROR({ goto cleanup_lst; }, "calloc: %s\n");
     }
 
-    int file_handle = -1;
-    if (cmd->redir.op[0] == '>') {
-        file_handle = open(cmd->redir.file_name, O_CREAT | O_WRONLY | ((cmd->redir.op[1] == '>') ? O_APPEND : O_TRUNC), S_IRWXU);
-        if (file_handle == -1) HANDLE_SYS_ERROR({ return; }, "fopen");
-    }
+    stat = analyze(&lst, toks, n_toks);
+    if (stat != SHELL_SUCCESS) goto cleanup_toks;
 
-    int *pipes = calloc(2 * n_execs, sizeof(*pipes));
-    if (pipes == NULL) HANDLE_SYS_ERROR({ goto close_file_handle; }, "calloc");
-    for (size_t i = 0; i < n_execs; ++i) if (pipe(pipes + 2 * i) == -1) HANDLE_SYS_ERROR({ goto parent_cleanup; }, "pipe");
+    if (lst.bg) {
+        ++sh.n_bg_procs;
 
-    for (size_t i = 0; i < n_execs; ++i) {
         pid_t child_pid = fork();
-        if (child_pid == -1) HANDLE_SYS_ERROR({ goto parent_cleanup; }, "fork");
+        if (child_pid == -1) HANDLE_SYS_ERROR({ return false; }, "fork: %s\n");
 
         if (child_pid == 0) {
-            if ((file_handle != -1) && (i != n_execs - 1)) {
-                if (close(file_handle) == -1) HANDLE_SYS_ERROR({ goto parent_cleanup; }, "close");
+            exec_list(&lst);
+
+            exit(EXIT_SUCCESS);
+        }
+
+        goto cleanup_lst;
+    }
+
+    exec_list(&lst);
+
+cleanup_lst:
+    for (size_t i = 0; i < n_pipelines; ++i) free_null((void **) lst.pipelines[i].cmds);
+    free_null((void **) lst.pipelines);
+cleanup_toks:
+    for (size_t i = 0; i < n_toks; ++i) {
+        if ((toks[i].type == CMD_NAME) || (toks[i].type == CMD_ARG)) free_null((void **) &toks[i].str);
+    }
+
+    free_null((void **) &toks);
+
+    return stat;
+}
+
+enum shell_status exec_list(const struct list *const lst)
+{
+    assert(lst != NULL);
+
+    enum shell_status stat = SHELL_SUCCESS;
+    size_t lst_idx = 0;
+    do {
+        if (lst_idx == 0) {
+            stat = exec_pipe(lst->pipelines);
+
+            continue;
+        }
+
+        switch (lst->pipelines[lst_idx - 1].list_op) {
+            case '|':
+                if (stat == SHELL_SUCCESS) {
+                    continue;
+                } else if (stat == SHELL_CHILD_PROCESS_ERROR) {
+                    stat = exec_pipe(&lst->pipelines[lst_idx]);
+                } else {
+                    return stat;
+                }
+
+                break;
+            case '&':
+                if (stat != SHELL_SUCCESS) {
+                    if (stat == SHELL_CHILD_PROCESS_ERROR) {
+                        continue;
+                    } else {
+                        return stat;
+                    }
+                } else {
+                    stat = exec_pipe(&lst->pipelines[lst_idx]);
+                }
+
+                break;
+            default:
+                HANDLE_LOGIC_ERROR({ return SHELL_LOGIC_ERROR; }, "unknown list operator '%c'", lst->pipelines[-1].list_op);
+        }
+    } while (lst->pipelines[lst_idx++].list_op != '\0');
+
+    return SHELL_SUCCESS;
+}
+
+enum shell_status exec_pipe(const struct pipeline *const pipeline)
+{
+    assert(pipeline != NULL);
+
+    int fd = -1;
+    if (pipeline->redir.op[0] == '>') {
+        fd = open(pipeline->redir.file_name, O_CREAT | O_WRONLY | ((pipeline->redir.op[1] == '>') ? O_APPEND : O_TRUNC), S_IRWXU);
+        if (fd == -1) HANDLE_SYS_ERROR({ return SHELL_SYS_ERROR; }, "fopen: %s\n");
+    }
+
+    if (pipeline->n_cmds == 1) return exec_single_cmd(pipeline, fd);
+
+    enum shell_status stat = SHELL_SUCCESS;
+
+    int *pipeline_fds = calloc(2 * pipeline->n_cmds, sizeof(*pipeline_fds));
+    if (pipeline_fds == NULL) HANDLE_SYS_ERROR({
+                                               stat = SHELL_SYS_ERROR;
+                                               goto close_file_handle;
+                                           }, "calloc: %s\n");
+    for (size_t i = 0; i < pipeline->n_cmds; ++i)
+        if (pipe(pipeline_fds + 2 * i) == -1) HANDLE_SYS_ERROR({
+                                                               stat = SHELL_SYS_ERROR;
+                                                               goto parent_cleanup;
+                                                           }, "pipeline: %s\n");
+
+    pid_t last_child_pid = 0;
+    for (size_t i = 0; i < pipeline->n_cmds; ++i) {
+        pid_t child_pid = fork();
+        if (child_pid == -1) HANDLE_SYS_ERROR({
+                                                  stat = SHELL_SYS_ERROR;
+                                                  goto parent_cleanup;
+                                              }, "fork: %s\n");
+
+        if (child_pid == 0) {
+            if ((fd != -1) && (i != pipeline->n_cmds - 1)) {
+                if (close(fd) == -1) HANDLE_SYS_ERROR({
+                                                          stat = SHELL_SYS_ERROR;
+                                                          goto parent_cleanup;
+                                                      }, "close: %s\n");
             }
 
-            for (size_t j = 0; j < 2 * n_execs; ++j) {
+            for (size_t j = 0; j < 2 * pipeline->n_cmds; ++j) {
                 if ((j != 2 * i) && (j != 2 * (i + 1) + 1)) {
-                    if (close(pipes[j]) == -1) HANDLE_SYS_ERROR({ goto parent_cleanup; }, "close");
+                    if (close(pipeline_fds[j]) == -1) HANDLE_SYS_ERROR({
+                                                                       stat = SHELL_SYS_ERROR;
+                                                                       goto parent_cleanup;
+                                                                   }, "close: %s\n");
                 }
             }
 
             if (i == 0) {
-                if (close(pipes[0]) == -1) HANDLE_SYS_ERROR({ goto child_cleanup; }, "close");
-                if (dup2(pipes[2 * 1 + 1], STDOUT_FILENO) == -1) HANDLE_SYS_ERROR({ goto child_cleanup; }, "dup2");
-            } else if (i == n_execs - 1) {
-                if (dup2(pipes[2 * (n_execs - 1)], STDIN_FILENO) == -1) HANDLE_SYS_ERROR({ goto child_cleanup; }, "dup2");
-                if (file_handle != -1) {
-                    if (dup2(file_handle, STDOUT_FILENO) == -1) HANDLE_SYS_ERROR({ goto child_cleanup; }, "dup2");
+                if (close(pipeline_fds[0]) == -1) HANDLE_SYS_ERROR({ goto child_cleanup; }, "close: %s\n");
+                if (dup2(pipeline_fds[2 * 1 + 1], STDOUT_FILENO) == -1) HANDLE_SYS_ERROR({ goto child_cleanup; }, "dup2: %s\n");
+            } else if (i == pipeline->n_cmds - 1) {
+                if (dup2(pipeline_fds[2 * (pipeline->n_cmds - 1)], STDIN_FILENO) == -1) HANDLE_SYS_ERROR({ goto child_cleanup; }, "dup2: %s\n");
+                if (fd != -1) {
+                    if (dup2(fd, STDOUT_FILENO) == -1) HANDLE_SYS_ERROR({ goto child_cleanup; }, "dup2: %s\n");
                 }
             } else {
-                if (dup2(pipes[2 * i], STDIN_FILENO) == -1) HANDLE_SYS_ERROR({ goto child_cleanup; }, "dup2");
-                if (dup2(pipes[2 * (i + 1) + 1], STDOUT_FILENO) == -1) HANDLE_SYS_ERROR({ goto child_cleanup; }, "dup2");
+                if (dup2(pipeline_fds[2 * i], STDIN_FILENO) == -1) HANDLE_SYS_ERROR({ goto child_cleanup; }, "dup2: %s\n");
+                if (dup2(pipeline_fds[2 * (i + 1) + 1], STDOUT_FILENO) == -1) HANDLE_SYS_ERROR({ goto child_cleanup; }, "dup2: %s\n");
             }
 
-            if (execvp(cmd->execs->argv[0], cmd->execs->argv) == -1) HANDLE_SYS_ERROR({}, "execvp");
+            if (execvp(pipeline->cmds[i].argv[0], pipeline->cmds[i].argv) == -1) HANDLE_SYS_ERROR({}, "execvp '%s': %s\n",
+                                                                                                  pipeline->cmds[i].argv[0]);
 
 child_cleanup:
-            free_null((void **) &pipes);
+            free_null((void **) &pipeline_fds);
 
-            if (file_handle != -1) if (close(file_handle) == -1) HANDLE_SYS_ERROR({}, "close");
-
-            exit(EXIT_FAILURE);
+            if (fd != -1) if (close(fd) == -1) HANDLE_SYS_ERROR({ exit(EXIT_FAILURE); }, "close: %s\n");
         }
-    }
-    for (size_t i = 0; i < n_execs; ++i) {
-        if (close(pipes[2 * i]) == -1) HANDLE_SYS_ERROR({ goto parent_cleanup; }, "close");
-        if (close(pipes[2 * i + 1]) == -1) HANDLE_SYS_ERROR({ goto parent_cleanup; }, "close");
+
+        if (i == pipeline->n_cmds - 1) last_child_pid = child_pid;
     }
 
-    int stat = 0;
+    bool last_cmd_error = true;
 
-    for (size_t i = 0; i < n_execs; ++i) {
-        if (wait(&stat) == -1) HANDLE_SYS_ERROR({}, "wait");
+    for (size_t i = 0; i < pipeline->n_cmds; ++i) {
+        if (close(pipeline_fds[2 * i]) == -1) HANDLE_SYS_ERROR({
+                                                               stat = SHELL_SYS_ERROR;
+                                                               goto parent_cleanup;
+                                                           }, "close: %s\n");
+        if (close(pipeline_fds[2 * i + 1]) == -1) HANDLE_SYS_ERROR({
+                                                                   stat = SHELL_SYS_ERROR;
+                                                                   goto parent_cleanup;
+                                                               }, "close: %s\n");
+    }
+
+    int child_stat = 0;
+    for (size_t i = 0; i < pipeline->n_cmds; ++i) {
+        pid_t child_pid = wait(&child_stat);
+        if (child_pid == -1) HANDLE_SYS_ERROR({
+                                                  stat = SHELL_SYS_ERROR;
+                                                  continue;
+                                              }, "wait: %s\n");
+
+        if (child_pid == last_child_pid) {
+            if (!WIFEXITED(child_stat)) HANDLE_LOGIC_ERROR({
+                                                               stat = SHELL_CHILD_PROCESS_ERROR;
+                                                               continue;
+                                                           }, "child did not terminate normally");
+
+            last_cmd_error = WEXITSTATUS(child_stat);
+        }
     }
 
 parent_cleanup:
-    free_null((void **) &pipes);
+    free_null((void **) &pipeline_fds);
 
 close_file_handle:
-    if (file_handle != -1) if (close(file_handle) == -1) HANDLE_SYS_ERROR({}, "close");
+    if (fd != -1) if (close(fd) == -1) HANDLE_SYS_ERROR({ return SHELL_SYS_ERROR; }, "close: %s\n");
+
+    if (stat != SHELL_SUCCESS) return stat;
+
+    return last_cmd_error ? SHELL_CHILD_PROCESS_ERROR : SHELL_SUCCESS;
 }
 
-void exec(const struct command *const cmd)
+enum shell_status exec_single_cmd(const struct pipeline *const cmd, int fd)
 {
     assert(cmd != NULL);
 
-    int file_handle = -1;
-    if (cmd->redir.op[0] == '>') {
-        file_handle = open(cmd->redir.file_name, O_CREAT | O_WRONLY | ((cmd->redir.op[1] == '>') ? O_APPEND : O_TRUNC), S_IRWXU);
-        if (file_handle == -1) HANDLE_SYS_ERROR({ return; }, "open");
-    }
-
     pid_t child_pid = fork();
-    if (child_pid == -1) HANDLE_SYS_ERROR({ return; }, "fork");
+    if (child_pid == -1) HANDLE_SYS_ERROR({ return SHELL_SYS_ERROR; }, "fork: %s\n");
 
     if (child_pid == 0) {
-        if (file_handle != -1) {
-            if (dup2(file_handle, STDOUT_FILENO) == -1) HANDLE_SYS_ERROR({ exit(EXIT_FAILURE); }, "dup2");
+        if (fd != -1) {
+            if (dup2(fd, STDOUT_FILENO) == -1) HANDLE_SYS_ERROR({ exit(EXIT_FAILURE); }, "dup2: %s\n");
         }
 
-        if (execvp(cmd->execs->argv[0], cmd->execs->argv) == -1) HANDLE_SYS_ERROR({ exit(EXIT_FAILURE); }, "execvp");
+        if (execvp(cmd->cmds->argv[0], cmd->cmds->argv) == -1) HANDLE_SYS_ERROR({ exit(EXIT_FAILURE); }, "execvp '%s': %s\n",
+                                                                                cmd->cmds->argv[0]);
     }
 
-    int stat = 0;
-    if (wait(&stat) == -1) HANDLE_SYS_ERROR({}, "wait");
+    enum shell_status stat = SHELL_SUCCESS;
 
-    if (file_handle != -1) {
-        if (close(file_handle) == -1) HANDLE_SYS_ERROR({}, "close");
+    int child_stat = 0;
+    if (wait(&child_stat) == -1) HANDLE_SYS_ERROR({ stat = SHELL_SYS_ERROR; }, "wait: %s\n");
+
+    if (fd != -1) {
+        if (close(fd) == -1) HANDLE_SYS_ERROR({ return SHELL_SYS_ERROR; }, "close: %s\n");
     }
+
+    if (stat != SHELL_SUCCESS) return stat;
+
+    if (!WIFEXITED(child_stat)) HANDLE_LOGIC_ERROR({ return SHELL_CHILD_PROCESS_ERROR; }, "child did not terminate normally");
+
+    return WEXITSTATUS(child_stat) ? SHELL_CHILD_PROCESS_ERROR : SHELL_SUCCESS;
 }
 
+enum shell_status shell_wait_bg_procs()
+{
+    enum shell_status stat = SHELL_SUCCESS;
+    for (size_t i = 0; i < sh.n_bg_procs; ++i) {
+        pid_t child_pid = wait(NULL);
+        if (child_pid == -1) HANDLE_SYS_ERROR({ stat = SHELL_SYS_ERROR; }, "wait: %s\n");
+    }
+
+    return stat;
+}
