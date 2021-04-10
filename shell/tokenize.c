@@ -5,57 +5,86 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
-#include "errors.h"
+#include "shell_errors.h"
 #include "token.h"
 
 static size_t cnt_tok(const char *input);
 static bool is_tok_delim(char ch);
 char *parse_str(const char **str);
-static void set_tok_type(struct token *tok, const struct token *prev_tok, bool first_tok);
 
-struct token *tokenize(char *str, size_t *n_tokens, size_t *n_execs)
+enum shell_status tokenize(char *str, struct token **const toks, size_t *const n_toks, size_t *const n_pipelines)
 {
     assert(str != NULL);
-    assert(n_tokens != NULL);
-    assert(n_execs != NULL);
+    assert(toks != NULL);
+    assert(n_toks != NULL);
 
-    *n_tokens = cnt_tok(str);
-    struct token *tokens = calloc(*n_tokens, sizeof(*tokens));
-    if (tokens == NULL) HANDLE_SYS_ERROR({ return NULL; }, "calloc");
+    *n_toks = cnt_tok(str);
+    *toks = calloc(*n_toks, sizeof(**toks));
+    if (toks == NULL) HANDLE_SYS_ERROR({ return SHELL_SYS_ERROR; }, "calloc: %s\n");
 
-    size_t token_idx = 0;
-    *n_execs = 0;
-    while ((*str != '\0') && (*str != '#')) {
+    size_t tok_idx = 0;
+    *n_pipelines = 0;
+    while ((*str != '\0')) {
+        assert(str != NULL);
+
         switch (*str++) {
             case ' ':
             case '\t':
             case '\n':
                 break;
             case '>':
-                tokens[token_idx].type = REDIR_OP;
-                tokens[token_idx].redir_op[0] = '>';
+                (*toks)[tok_idx].type = REDIR_OP;
+                (*toks)[tok_idx].op[0] = '>';
 
-                if (*str == '>') tokens[token_idx].redir_op[1] = *str;
+                if (*str == '>') (*toks)[tok_idx].op[1] = *str++;
 
-                ++token_idx;
+                ++tok_idx;
 
                 break;
             case '|':
-                tokens[token_idx++].type = PIPE_OP;
-                ++*n_execs;
+                if (*str == '|') {
+                    (*toks)[tok_idx].type = LIST_OP;
+                    (*toks)[tok_idx++].op[0] = '|';
+                    ++*n_pipelines;
+                    ++str;
+                } else {
+                    (*toks)[tok_idx++].type = PIPE_OP;
+                }
 
                 break;
+            case '&':
+                if (*str == '&') {
+                    (*toks)[tok_idx].type = LIST_OP;
+                    (*toks)[tok_idx++].op[0] = '&';
+                    ++*n_pipelines;
+                    ++str;
+                } else {
+                    (*toks)[tok_idx++].type = BG_OP;
+                }
+
+                break;
+            case '#':
+                return SHELL_SUCCESS;
             default:
                 --str;
-                tokens[token_idx].str = parse_str((const char **) &str);
-                set_tok_type(&tokens[token_idx], &tokens[token_idx - 1], *n_execs == 0);
-                if ((tokens[token_idx++].type == EXEC_NAME) && (*n_execs == 0)) *n_execs = 1;
+                (*toks)[tok_idx].str = parse_str((const char **) &str);
+                if ((*n_pipelines == 0) || ((*toks)[tok_idx - 1].type == PIPE_OP) || ((*toks)[tok_idx - 1].type == LIST_OP)) {
+                    (*toks)[tok_idx].type = CMD_NAME;
+                } else if ((*toks)[tok_idx - 1].type == REDIR_OP) {
+                    (*toks)[tok_idx].type = REDIR_FILE_NAME;
+                } else {
+                    (*toks)[tok_idx].type = CMD_ARG;
+                }
+                if (((*toks)[tok_idx].type == CMD_NAME) && (*n_pipelines == 0)) {
+                    *n_pipelines = 1;
+                }
+                ++tok_idx;
 
                 break;
         }
     }
 
-    return tokens;
+    return SHELL_SUCCESS;
 }
 
 size_t cnt_tok(const char *input)
@@ -64,10 +93,12 @@ size_t cnt_tok(const char *input)
 
     if (*input == '\0') return 0;
 
+    const char *const input_begin = input;
     size_t n_toks = 0;
     char quote = '\0';
-    bool eos = false;
-    while (!eos && (*input != '\0') && (*input != '#')) {
+    while ((*input != '\0')) {
+        assert(input != NULL);
+
         switch (*input) {
             case '\'':
             case '\"':
@@ -85,19 +116,33 @@ size_t cnt_tok(const char *input)
 
                 break;
             case '\\':
-                if (((quote == '\"') && (input[1] == '\"')) || (quote == '\0')) ++input;
+                if (((quote == '\"') && ((input[1] == '\"') || (input[1] == '\\'))) || (quote == '\0')) ++input;
 
                 break;
-            case '#':
-                eos = true;
+            case '|':
+            case '>':
+            case '&':
+                if (quote != '\0') break;
+
+                if (input != input_begin) {
+                    if (input[-1] != input[0]) {
+                        ++n_toks;
+
+                        if (!isspace(input[-1])) ++n_toks;
+                    }
+                }
 
                 break;
             case ' ':
             case '\t':
             case '\n':
-                if (quote != '\0') break;
+                if ((quote == '\0') && (input != input_begin)) n_toks += !is_tok_delim(input[-1]);
 
-                n_toks += !is_tok_delim(input[-1]);
+                break;
+            case '#':
+                if (quote == '\0') {
+                    return n_toks + ((input != input_begin) ? !is_tok_delim(input[-1]) : 0);
+                }
 
                 break;
             default:
@@ -112,7 +157,7 @@ size_t cnt_tok(const char *input)
 
 bool is_tok_delim(const char ch)
 {
-    return (ch == '\'') || (ch == '\"') || (ch == ' ') || (ch == '\t') || (ch == '\n');
+    return (ch == '|') || (ch == '&') || (ch == '>') || (ch == '\'') || (ch == '\"') || (ch == ' ') || (ch == '\t') || (ch == '\n');
 }
 
 char *parse_str(const char **const str)
@@ -125,6 +170,8 @@ char *parse_str(const char **const str)
     bool eos = false;
     size_t res_len = 0;
     while (!eos && (**str != '\0')) {
+        assert(*str != NULL);
+
         switch (**str) {
             case '\'':
             case '\"':
@@ -143,13 +190,13 @@ char *parse_str(const char **const str)
 
                 break;
             case '\\':
-                if (((quote == '\"') && ((*str)[1] == '\"')) || (quote == '\0')) ++*str;
+                if (((quote == '\"') && (((*str)[1] == '\"') || ((*str)[1] == '\\'))) || (quote == '\0')) ++*str;
 
                 break;
             case '#':
-                eos = true;
-
-                break;
+            case '|':
+            case '>':
+            case '&':
             case ' ':
             case '\t':
             case '\n':
@@ -168,14 +215,15 @@ char *parse_str(const char **const str)
         ++*str;
     }
 
-    char *res = calloc(res_len, sizeof(*res));
-    if (res == NULL) HANDLE_SYS_ERROR({ return NULL; }, "calloc");
+    char *res = calloc(res_len + 1, sizeof(*res));
+    if (res == NULL) HANDLE_SYS_ERROR({ return NULL; }, "calloc: %s\n");
 
     *str = str_begin;
     size_t idx = 0;
     quote = '\0';
-    eos = false;
-    while (!eos && (**str != '\0')) {
+    while (**str != '\0') {
+        assert(*str != NULL);
+
         switch (**str) {
             case '\'':
             case '\"':
@@ -194,21 +242,17 @@ char *parse_str(const char **const str)
 
                 break;
             case '\\':
-                if ((quote == '\"') && ((*str)[1] == '\"') || (quote == '\0')) ++*str;
+                if ((quote == '\"') && (((*str)[1] == '\"') || ((*str)[1] == '\\')) || (quote == '\0')) ++*str;
 
                 break;
             case '#':
-                eos = true;
-
-                break;
+            case '|':
+            case '>':
+            case '&':
             case ' ':
             case '\t':
             case '\n':
-                if (quote == '\0') {
-                    eos = true;
-
-                    continue;
-                }
+                if (quote == '\0') return res;
 
                 break;
             default:
@@ -219,15 +263,4 @@ char *parse_str(const char **const str)
     }
 
     return res;
-}
-
-void set_tok_type(struct token *tok, const struct token *prev_tok, bool first_tok)
-{
-    if (first_tok || (prev_tok->type == PIPE_OP)) {
-        tok->type = EXEC_NAME;
-    } else if (prev_tok->type == REDIR_OP) {
-        tok->type = REDIR_FILE_NAME;
-    } else {
-        tok->type = EXEC_ARG;
-    }
 }
