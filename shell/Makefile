@@ -1,16 +1,16 @@
-CC	=  cc
-CFLAGS	=  -I.
+CC	     =  clang
+CFLAGS	 =  -I.
 CFLAGS	+= -W -Wall -Wextra -Werror -Wfloat-equal
 CFLAGS	+= -Wundef -Wpointer-arith -Wcast-align -Wshadow
 CFLAGS	+= -Wstrict-overflow=5 -Wwrite-strings -Waggregate-return
 CFLAGS	+= -Wswitch-enum -Wunreachable-code -Winit-self
 CFLAGS	+= -Wno-unused-parameter -pedantic -O3
-LDFLAGS	=
+LDFLAGS	 =
 
 BASE_SOURCES = main.c tokenize.c analyze.c heap.c shell.c
-SOURCES		 = $(BASE_SOURCES)
-OBJS		 = $(SOURCES:.c=.o)
-EXECUTABLE	 = task_2
+SOURCES      = $(BASE_SOURCES)
+OBJS	     = $(SOURCES:.c=.o)
+EXECUTABLE   = task_2
 
 all: test
 
