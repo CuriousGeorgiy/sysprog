@@ -3,8 +3,9 @@
 
 #include <stddef.h>
 
+#include "shell_errors.h"
 #include "token.h"
 
-struct token *tokenize(char *str, size_t *n_tokens, size_t *n_execs);
+enum shell_status tokenize(char *str, struct token **toks, size_t *n_toks, size_t *n_pipelines);
 
 #endif /* TOKENIZE_H */
