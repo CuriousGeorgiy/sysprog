@@ -1,11 +1,13 @@
-#ifndef ANALYZER_H
-#define ANALYZER_H
+#ifndef ANALYZE_H
+#define ANALYZE_H
 
 #include <stdbool.h>
 
-#include "command.h"
+#include "shell_errors.h"
+#include "list.h"
+#include "pipeline.h"
 #include "token.h"
 
-bool analyze(struct command *cmd, const struct token *tokens, size_t n_tokens, size_t n_execs);
+enum shell_status analyze(struct list *lst, const struct token *toks, size_t n_toks);
 
-#endif /* ANALYZER_H */
+#endif /* ANALYZE_H */
