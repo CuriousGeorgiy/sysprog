@@ -1,5 +1,5 @@
-#ifndef TOKENIZER_H
-#define TOKENIZER_H
+#ifndef TOKENIZE_H
+#define TOKENIZE_H
 
 #include <stddef.h>
 
@@ -7,4 +7,4 @@
 
 struct token *tokenize(char *str, size_t *n_tokens, size_t *n_execs);
 
-#endif /* TOKENIZER_H */
+#endif /* TOKENIZE_H */

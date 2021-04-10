@@ -1,7 +1,14 @@
-#ifndef ERRORS_H
-#define ERRORS_H
+#ifndef SHELL_ERRORS_H
+#define SHELL_ERRORS_H
 
+#include <stdbool.h>
 #include <stdio.h>
+
+enum status {
+    OK,
+    ESYS,
+    ELOGIC
+};
 
 /*!
  * Macro for handling errors
@@ -10,21 +17,21 @@
  * handling error
  */
 #define HANDLE_SYS_ERROR(error_handling_src_code, error_description) \
-do {                                                                 \
+{                                                                    \
     perror(error_description);                                       \
                                                                      \
     {                                                                \
         error_handling_src_code                                      \
     }                                                                \
-} while(0)
+} do {} while (false)
 
 #define HANDLE_LOGIC_ERROR(error_handling_src_code, ...) \
-do {                                                     \
+{                                                        \
     fprintf(stderr, __VA_ARGS__);                        \
                                                          \
     {                                                    \
         error_handling_src_code                          \
     }                                                    \
-} while (0)
+} do {} while (false)
 
-#endif /* ERRORS_H */
+#endif /* SHELL_ERRORS_H */
