@@ -242,7 +242,7 @@ char *parse_str(const char **const str)
 
                 break;
             case '\\':
-                if ((quote == '\"') && (((*str)[1] == '\"') || ((*str)[1] == '\\')) || (quote == '\0')) ++*str;
+                if (((quote == '\"') && (((*str)[1] == '\"') || ((*str)[1] == '\\'))) || (quote == '\0')) ++*str;
 
                 break;
             case '#':
