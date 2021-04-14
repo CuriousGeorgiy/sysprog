@@ -2,3 +2,10 @@
 
 CMakeLists.txt
 cmake-build-debug
+
+*.o
+
+*.py
+*.txt
+
+task-2
